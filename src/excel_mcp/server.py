@@ -25,6 +25,7 @@ from excel_mcp.chart import create_chart_in_sheet as create_chart_impl
 from excel_mcp.workbook import get_workbook_info
 from excel_mcp.data import write_data
 from excel_mcp.pivot import create_pivot_table as create_pivot_table_impl
+from excel_mcp.pivot_info import get_pivot_tables_info as get_pivot_tables_info_impl
 from excel_mcp.tables import create_excel_table as create_table_impl
 from excel_mcp.sheet import (
     copy_sheet,
@@ -349,6 +350,24 @@ def create_pivot_table(
     except Exception as e:
         logger.error(f"Error creating pivot table: {e}")
         raise
+
+
+@mcp.tool()
+def get_pivot_tables_info(
+    filepath: str,
+    sheet_name: str,
+) -> str:
+    """Return metadata for pivot tables in a worksheet."""
+
+    try:
+        full_path = get_excel_path(filepath)
+        return get_pivot_tables_info_impl(full_path, sheet_name)
+    except (ValidationError, PivotError, SheetError) as e:
+        return f"Error: {str(e)}"
+    except Exception as e:
+        logger.error(f"Error inspecting pivot tables: {e}")
+        raise
+
 
 @mcp.tool()
 def create_table(
