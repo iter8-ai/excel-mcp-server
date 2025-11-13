@@ -355,13 +355,13 @@ def create_pivot_table(
 @mcp.tool()
 def get_pivot_tables_info(
     filepath: str,
-    sheet_name: str,
+    sheet_names: List[str],
 ) -> str:
-    """Return metadata for pivot tables in a worksheet."""
+    """Return metadata for pivot tables in one or more worksheets."""
 
     try:
         full_path = get_excel_path(filepath)
-        return get_pivot_tables_info_impl(full_path, sheet_name)
+        return get_pivot_tables_info_impl(full_path, sheet_names)
     except (ValidationError, PivotError, SheetError) as e:
         return f"Error: {str(e)}"
     except Exception as e:

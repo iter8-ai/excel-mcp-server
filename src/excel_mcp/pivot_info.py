@@ -52,28 +52,40 @@ class PivotTablesSummary(msgspec.Struct, kw_only=True):
     warnings: list[str] = msgspec.field(default_factory=list)
 
 
-def get_pivot_tables_info(filepath: str, sheet_name: str) -> str:
-    """Read pivot table metadata and return it as a JSON string."""
+class PivotTablesMultiSheetResult(msgspec.Struct, kw_only=True):
+    """Pivot table metadata for multiple worksheets."""
+
+    workbook: str
+    format: str
+    sheets: list[PivotTablesSummary] = msgspec.field(default_factory=list)
+    warnings: list[str] = msgspec.field(default_factory=list)
+
+
+def get_pivot_tables_info(filepath: str, sheet_names: list[str]) -> str:
+    """Read pivot table metadata for multiple sheets and return it as a JSON string."""
 
     path = Path(filepath)
     if not path.exists():
         raise ValidationError(f"File not found: {filepath}")
 
+    if not sheet_names:
+        raise ValidationError("At least one sheet name must be provided")
+
     suffix = path.suffix.lower()
     if suffix in XLSX_EXTENSIONS:
-        summary = _extract_xlsx_pivots(path, sheet_name)
+        result = _extract_xlsx_pivots_multi(path, sheet_names)
     elif suffix == ".xls":
-        summary = _extract_xls_pivots(path, sheet_name)
+        result = _extract_xls_pivots_multi(path, sheet_names)
     else:
         raise ValidationError(
             f"Unsupported workbook format '{path.suffix}'. "
             "Only .xlsx and .xls files are supported."
         )
 
-    return msgjson.encode(summary).decode("utf-8")
+    return msgjson.encode(result).decode("utf-8")
 
 
-def _extract_xlsx_pivots(path: Path, sheet_name: str) -> PivotTablesSummary:
+def _extract_xlsx_pivots_multi(path: Path, sheet_names: list[str]) -> PivotTablesMultiSheetResult:
     try:
         wb = load_workbook(path, data_only=True, keep_links=True, read_only=False)
     except InvalidFileException as exc:
@@ -82,32 +94,62 @@ def _extract_xlsx_pivots(path: Path, sheet_name: str) -> PivotTablesSummary:
         raise PivotError(f"Failed to load workbook: {exc}") from exc
 
     try:
-        if sheet_name not in wb.sheetnames:
-            raise SheetError(f"Sheet '{sheet_name}' not found")
+        summaries: list[PivotTablesSummary] = []
+        global_warnings: list[str] = []
+        missing_sheets: list[str] = []
 
-        ws = wb[sheet_name]
-        pivot_defs = list(getattr(ws, "_pivots", []) or [])
+        for sheet_name in sheet_names:
+            if sheet_name not in wb.sheetnames:
+                missing_sheets.append(sheet_name)
+                continue
 
-        pivots: list[PivotTableInfo] = []
-        warnings: list[str] = []
-
-        for pivot in pivot_defs:
             try:
-                pivots.append(_build_pivot_info(pivot))
-            except Exception as exc:  # pragma: no cover - narrow failure
-                name = getattr(pivot, "name", "unknown")
-                logger.exception("Failed to read pivot metadata for %s", name)
-                warnings.append(f"Failed to read pivot '{name}': {exc}")
+                ws = wb[sheet_name]
+                pivot_defs = list(getattr(ws, "_pivots", []) or [])
 
-        return PivotTablesSummary(
+                pivots: list[PivotTableInfo] = []
+                warnings: list[str] = []
+
+                for pivot in pivot_defs:
+                    try:
+                        pivots.append(_build_pivot_info(pivot))
+                    except Exception as exc:  # pragma: no cover - narrow failure
+                        name = getattr(pivot, "name", "unknown")
+                        logger.exception("Failed to read pivot metadata for %s", name)
+                        warnings.append(f"Failed to read pivot '{name}': {exc}")
+
+                summaries.append(
+                    PivotTablesSummary(
+                        workbook=path.name,
+                        sheet=sheet_name,
+                        format="xlsx",
+                        pivot_tables=pivots,
+                        warnings=warnings,
+                    )
+                )
+            except Exception as exc:
+                logger.exception("Failed to process sheet '%s'", sheet_name)
+                global_warnings.append(f"Failed to process sheet '{sheet_name}': {exc}")
+
+        if missing_sheets:
+            global_warnings.append(f"Sheet(s) not found: {', '.join(missing_sheets)}")
+
+        return PivotTablesMultiSheetResult(
             workbook=path.name,
-            sheet=sheet_name,
             format="xlsx",
-            pivot_tables=pivots,
-            warnings=warnings,
+            sheets=summaries,
+            warnings=global_warnings,
         )
     finally:
         wb.close()
+
+
+def _extract_xlsx_pivots(path: Path, sheet_name: str) -> PivotTablesSummary:
+    """Legacy function for single sheet extraction."""
+    result = _extract_xlsx_pivots_multi(path, [sheet_name])
+    if not result.sheets:
+        raise SheetError(f"Sheet '{sheet_name}' not found")
+    return result.sheets[0]
 
 
 def _build_pivot_info(pivot) -> PivotTableInfo:
@@ -180,43 +222,67 @@ def _build_pivot_info(pivot) -> PivotTableInfo:
     )
 
 
-def _extract_xls_pivots(path: Path, sheet_name: str) -> PivotTablesSummary:
-    warnings = [
+def _extract_xls_pivots_multi(path: Path, sheet_names: list[str]) -> PivotTablesMultiSheetResult:
+    global_warnings = [
         "Pivot metadata extraction for .xls files is limited. "
         "Convert the workbook to .xlsx for full details."
     ]
 
-    pivot_infos: list[PivotTableInfo] = []
+    summaries: list[PivotTablesSummary] = []
+    missing_sheets: list[str] = []
 
     try:
         import xlrd  # Local import to avoid mandatory dependency when unused
 
         book = xlrd.open_workbook(path)
-        if sheet_name not in book.sheet_names():
-            raise SheetError(f"Sheet '{sheet_name}' not found")
-    except SheetError:
-        raise
+        available_sheets = book.sheet_names()
+
+        for sheet_name in sheet_names:
+            if sheet_name not in available_sheets:
+                missing_sheets.append(sheet_name)
+                continue
+
+            pivot_names, scan_warnings = _scan_xls_pivot_names(path)
+            global_warnings.extend(scan_warnings)
+
+            pivot_infos: list[PivotTableInfo] = []
+            for name in pivot_names:
+                pivot_infos.append(
+                    PivotTableInfo(
+                        name=name,
+                        warnings=["Only the pivot table name could be determined for this .xls file."],
+                    )
+                )
+
+            summaries.append(
+                PivotTablesSummary(
+                    workbook=path.name,
+                    sheet=sheet_name,
+                    format="xls",
+                    pivot_tables=pivot_infos,
+                    warnings=[],
+                )
+            )
     except Exception as exc:
         raise PivotError(f"Failed to read .xls workbook: {exc}") from exc
 
-    pivot_names, scan_warnings = _scan_xls_pivot_names(path)
-    warnings.extend(scan_warnings)
+    if missing_sheets:
+        global_warnings.append(f"Sheet(s) not found: {', '.join(missing_sheets)}")
 
-    for name in pivot_names:
-        pivot_infos.append(
-            PivotTableInfo(
-                name=name,
-                warnings=["Only the pivot table name could be determined for this .xls file."],
-            )
-        )
-
-    return PivotTablesSummary(
+    return PivotTablesMultiSheetResult(
         workbook=path.name,
-        sheet=sheet_name,
         format="xls",
-        pivot_tables=pivot_infos,
-        warnings=warnings,
+        sheets=summaries,
+        warnings=global_warnings,
     )
+
+
+def _extract_xls_pivots(path: Path, sheet_name: str) -> PivotTablesSummary:
+    """Legacy function for single sheet extraction."""
+    result = _extract_xls_pivots_multi(path, [sheet_name])
+    if not result.sheets:
+        raise SheetError(f"Sheet '{sheet_name}' not found")
+    return result.sheets[0]
 
 
 def _scan_xls_pivot_names(path: Path) -> tuple[list[str], list[str]]:
